@@ -36,6 +36,7 @@ import apexpy
 from .mlt_utils import mlon_to_mlt
 from builtins import range
 
+MU0   = 4*np.pi*1e-7 # Permeability constant
 d2r = np.pi/180
 
 DEFAULT = object()
@@ -685,6 +686,171 @@ def getG0_dipole(mlat, mlt, height, h_R = 110., NT = 65, MT = 3, NV = 45, MV = 3
                                   B_V_n, 
                                   B_V_u))
                       ))
+
+    return G
+
+
+def getG0_Jtot(glat, glon, height, time, epoch = 2015., h_R = 110., NT = 65, MT = 3, NV = 45, MV = 3,
+          killpoloidal=False,
+          killtoroidal=False):
+    """ calculate the G matrix for the constant term in the AMPS model. The constant term is the 
+        term that depends only on the spherical harmonic coefficients that are not scaled by 
+        external parameters. This G matrix can be used to produce the full matrix.
+
+        The structure of the matrix is such that G0.dot(m), the product of the matrix with the 
+        first 1/19 of the model vector, will be model values of the eastward and northward
+        components of the horizontal current, stacked in a column vector.
+
+        glat, glon, time, and height must all have the same number of elements (let's call this N)
+
+        Parameters
+        ----------
+        glat : array
+            Geodetic latitude (degrees)
+        glon : array
+            Geographic/geodetic longitude (degrees)
+        height : array
+            Geodetic heights, in km
+        time : array
+            Array of datetimes corresponding to each point. This is needed to calculate 
+            magnetic local time.
+        epoch : float, optional
+            The epoch used for conversion to apex coordinates. Default 2015.
+        h_R : float, optional
+            Reference height used in conversion to modified apex coordinates. Default 110 km.
+        NT, MT, NV, MV: int, optional
+            Truncation level. Must match coefficient file
+
+        Returns
+        -------
+        G0 : array
+            an 3N by M matrix, where N is the number of elements in the input coordinates. There will be
+            3 times as many rows G0, since there are 3 components. Partionining G0 in thirds, from top to
+            bottom, gives the parts that correspond to east, north, and up, respectively. M
+            is the number of terms in the spherical harmonic expansion of J
+
+
+    S. M. Hatch
+    April 2025
+    """
+
+    glat   = np.asarray(glat).flatten()
+    glon   = np.asarray(glon).flatten()
+    height = np.asarray(height).flatten()
+
+    # convert to magnetic coords and get base vectors
+    a = apexpy.Apex(epoch, refh = h_R)
+    qlat, qlon = a.geo2qd(  glat.flatten(), glon.flatten(), height.flatten())
+    alat, alon = a.geo2apex(glat.flatten(), glon.flatten(), height.flatten())
+    f1, f2, f3, g1, g2, g3, d1, d2, d3, e1, e2, e3 = a.basevectors_apex(qlat, qlon, height, coords  = 'qd')
+    f1e = f1[0].reshape(-1, 1) # base vector components as column vectors
+    f1n = f1[1].reshape(-1, 1)
+    f2e = f2[0].reshape(-1, 1)
+    f2n = f2[1].reshape(-1, 1)
+    d1e = d1[0].reshape(-1, 1)
+    d1n = d1[1].reshape(-1, 1)
+    d2e = d2[0].reshape(-1, 1)
+    d2n = d2[1].reshape(-1, 1)
+
+    # calculate magnetic local time
+    phi = mlon_to_mlt(qlon, time, a.year)[:, np.newaxis]*15 # multiply by 15 to get degrees
+
+    # turn the coordinate arrays into column vectors:
+    alat, qlat, h = map(lambda x: x.flatten()[:, np.newaxis], [alat, qlat, height])
+
+    # generate spherical harmonic keys    
+    keys = {} # dictionary of spherical harmonic keys
+    keys['cos_T'] = SHkeys(NT, MT).setNmin(1).MleN().Mge(0)
+    keys['sin_T'] = SHkeys(NT, MT).setNmin(1).MleN().Mge(1)
+    keys['cos_V'] = SHkeys(NV, MV).setNmin(1).MleN().Mge(0)
+    keys['sin_V'] = SHkeys(NV, MV).setNmin(1).MleN().Mge(1)
+    m_cos_V = keys['cos_V'].m
+    m_sin_V = keys['sin_V'].m
+    m_cos_T = keys['cos_T'].m
+    m_sin_T = keys['sin_T'].m
+
+    nV = np.hstack((keys['cos_V'].n, keys['sin_V'].n))
+
+    # generate Legendre matrices - first get dicts of arrays, and then stack them in the appropriate fashion
+    legendre_T = legendre(NT, MT, 90 - alat, keys = keys['cos_T'])
+    legendre_V = legendre(NV, MV, 90 - qlat, keys = keys['cos_V'])
+    P_cos_T  =  legendre_T[:, :len(keys['cos_T']) ] # split
+    dP_cos_T = -legendre_T[:,  len(keys['cos_T']):]
+    P_cos_V  =  legendre_V[:, :len(keys['cos_V']) ] # split
+    dP_cos_V = -legendre_V[:,  len(keys['cos_V']):]
+    P_sin_T  =  P_cos_T[ :, keys['cos_T'].m.flatten() != 0] 
+    dP_sin_T =  dP_cos_T[:, keys['cos_T'].m.flatten() != 0]
+    P_sin_V  =  P_cos_V[ :, keys['cos_V'].m.flatten() != 0]
+    dP_sin_V =  dP_cos_V[:, keys['cos_V'].m.flatten() != 0]  
+
+    # trig matrices:
+    cos_T  =  np.cos(phi * d2r * m_cos_T)
+    sin_T  =  np.sin(phi * d2r * m_sin_T)
+    cos_V  =  np.cos(phi * d2r * m_cos_V)
+    sin_V  =  np.sin(phi * d2r * m_sin_V)
+    dcos_T = -np.sin(phi * d2r * m_cos_T)
+    dsin_T =  np.cos(phi * d2r * m_sin_T)
+    dcos_V = -np.sin(phi * d2r * m_cos_V)
+    dsin_V =  np.cos(phi * d2r * m_sin_V)
+
+
+    cos_qlat   = np.cos(qlat * d2r)
+    cos_alat   = np.cos(alat * d2r)
+
+    rtor_T = -1.e-6/MU0
+    r  = refre + h
+    # rtor_V = refre/r
+    rtor_V = (refre / (refre + h)) ** (nV + 2.) * (2 * nV + 1.)/ nV / MU0 * 1e-6    
+
+    #This refers to the scalar function alpha defined by Equation (22) in Laundal et al (2016)
+    # The curl-free current J,cf = grad alpha
+    jcf_east  = rtor_T * np.hstack((P_cos_T * m_cos_T * dcos_T, P_sin_T * m_sin_T * dsin_T)) / cos_alat # = dalpha_dalat
+    jcf_north = rtor_T * np.hstack((dP_cos_T * cos_T, dP_sin_T * sin_T)) # = dalpha_dlon
+
+    # for div-free current, we gets
+    jdf_east  =  rtor_V * np.hstack( (dP_cos_V * cos_V,
+                                      dP_sin_V * sin_V ))
+    jdf_north = -rtor_V * np.hstack( (P_cos_V * m_cos_V * dcos_V,
+                                      P_sin_V * m_sin_V * dsin_V )) / cos_qlat
+
+    # sinI  = 2 * np.sin( alat * d2r )/np.sqrt(4 - 3*cos_alat**2)
+
+    # F = f1e*f2n - f1n*f2e
+
+
+    # # matrix with horizontal spherical harmonic functions in QD coordinates
+    # V        = np.hstack((P_cos_V * cos_V, P_sin_V * sin_V ))
+
+    # # matrices with partial derivatives in QD coordinates:
+    # dV_dqlon  = np.hstack(( P_cos_V * dcos_V * m_cos_V,  P_sin_V * dsin_V * m_sin_V ))
+    # dV_dqlat  = np.hstack((dP_cos_V *  cos_V          , dP_sin_V *  sin_V           ))
+
+    # # matrices with partial derivatives in MA coordinates:
+    # # dT_dalon  = np.hstack(( P_cos_T * dcos_T * m_cos_T,  P_sin_T * dsin_T * m_sin_T))
+    # # dT_dalat  = np.hstack((dP_cos_T *  cos_T          , dP_sin_T *  sin_T          ))
+
+    # # Toroidal field components
+    # B_T_e  =   -d1n * dT_dalon / cos_alat + d2n * dT_dalat / sinI
+    # B_T_n  =    d1e * dT_dalon / cos_alat - d2e * dT_dalat / sinI
+    # B_T_u  =    np.zeros(B_T_n.shape)
+
+    # # Poloidal field components:
+    # B_V_e = (-f2n / (cos_qlat * r) * dV_dqlon + f1n * dV_dqlat / r) * refre * Rtor ** (nV + 1)
+    # B_V_n = ( f2e / (cos_qlat * r) * dV_dqlon - f1e * dV_dqlat / r) * refre * Rtor ** (nV + 1)
+    # B_V_u = np.sqrt(F) * V  * (nV + 1) * Rtor ** (nV + 2)
+    if killpoloidal:
+        jdf_east  *= 0
+        jdf_north *= 0
+    if killtoroidal:
+        jcf_east  *= 0
+        jcf_north *= 0
+
+    # combine:
+    G     = np.hstack((np.vstack((jcf_east  , 
+                                  jcf_north  )),
+                       np.vstack((jdf_east, 
+                                  jdf_north))
+                       ))
 
     return G
 
