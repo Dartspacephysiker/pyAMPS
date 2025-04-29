@@ -6,11 +6,11 @@
     no longer useful.
 """
 from __future__ import absolute_import
-import os.path
 import time
 import numpy as np
 import pandas as pd
-from .sh_utils import SHkeys
+from sh_utils import SHkeys
+from .coefficients import MODEL_VECTOR_LATEST, MODEL_COEFF_LATEST
 
 # header
 t = time.ctime().split(' ')
@@ -19,7 +19,7 @@ header = '# Sherical harmonic coefficients for the Average Magnetic field and Po
 header = header + '# Produced ' + date
 header = header + """
 #
-# Based on magnetic field measurements from CHAMP (2001-08 to 2010-09) and Swarm (2013-12 to 2021-02).
+# Based on magnetic field measurements from CHAMP (2001-08 to 2010-09) and Swarm (2013-12 to 2023-12).
 # Reference: Laundal et al., "Solar wind and seasonal influence on ionospheric currents", Journal of Geophysical Research - Space Physics, doi:10.1029/2018JA025387, 2018
 #
 # Coefficient unit: nT
@@ -33,10 +33,8 @@ header = header + """
 """
 
 
-basepath = os.path.dirname(__file__)
-
 # load model vector and define truncation levels and external parametrisation
-model_vector = np.load(os.path.abspath(os.path.join(basepath,'coefficients/model_vector_NT_MT_NV_MV_65_3_45_3.npy')))
+model_vector = np.load(MODEL_VECTOR_LATEST)
 NT, MT, NV, MV = 65, 3, 45, 3
 
 external_parameters = ['const', 'sinca', 'cosca', 'epsilon', 'epsilon_sinca', 'epsilon_cosca', 'tilt', 
@@ -82,11 +80,10 @@ for m, param in zip(dataframes, external_parameters):
 coefficients = pd.concat(dataframes, axis = 1)
 
 # write txt file
-with open(os.path.abspath(os.path.join(basepath,'coefficients/SW_OPER_MIO_SHA_2E_00000000T000000_99999999T999999_0104.txt')), 'w') as file:
+with open(MODEL_COEFF_LATEST, 'w') as file:
     # header:
     file.write(header)
     # data:
     coefficients.to_string(buf = file, float_format = lambda x: '{:.7f}'.format(x), 
                            header = False, sparsify = False,
                            index_names = False)
-
