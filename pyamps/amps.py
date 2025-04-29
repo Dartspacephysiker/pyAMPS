@@ -44,7 +44,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import rc
 from .plot_utils import equal_area_grid, Polarsubplot
-from .sh_utils import legendre, getG0, getG0_dipole, get_ground_field_G0
+from .sh_utils import legendre, getG0, getG0_dipole, get_ground_field_G0, getG0_Jtot
 from .model_utils import get_model_vectors, get_m_matrix, get_m_matrix_pol, get_coeffs, default_coeff_fn, get_truncation_levels
 from functools import reduce
 from builtins import range
@@ -1902,4 +1902,137 @@ def get_B_ground(qdlat, mlt, height, v, By, Bz, tilt, f107, current_height = 110
 
     # the resulting array will be stacked Be, Bn, Bu components. Return the partions
     return np.split(B, 3)
+
+
+def get_J_horiz(glat, glon, height, time, v, By, Bz, tilt, f107, epoch = 2015., h_R = 110., chunksize = 15000, coeff_fn = default_coeff_fn,
+                coords = 'apex',
+                kill_curlfree=False,
+                kill_divfree=False):
+    """ Calculate model horizontal current, both div-free and curl-free contributions (unless kill_curlfree or kill_divfree == True)
+
+    This function uses dask to parallelize computations. That means that it is quite
+    fast and that the memory consumption will not explode unless `chunksize` is too large.
+
+    Parameters
+    ----------
+    glat : array_like
+        array of geographic latitudes (degrees)
+    glon : array_like
+        array of geographic longitudes (degrees)
+    height : array_like
+        array of geodetic heights (km)
+    time : array_like
+        list/array of datetimes, needed to calculate magnetic local time
+    v : array_like
+        array of solar wind velocities in GSM/GSE x direction (km/s)
+    By : array_like
+        array of solar wind By values (nT)
+    Bz : array_like
+        array of solar wind Bz values (nT)
+    tilt : array_like
+        array of dipole tilt angles (degrees)
+    f107 : array_like
+        array of F10.7 index values (SFU)
+    epoch : float, optional
+        epoch (year) used in conversion to magnetic coordinates with the IGRF. Default = 2015.
+    h_R : float, optional
+        reference height (km) used when calculating modified apex coordinates. Default = 110.
+    chunksize : int, optional
+        the input arrays will be split in chunks in order to parallelize
+        computations. Larger chunks consumes more memory, but might be faster. Default is 15000.
+    coeff_fn: str, optional
+        file name of model coefficients - must be in format produced by model_vector_to_txt.py
+        (default is latest version)
+
+
+    Returns
+    -------
+    Je : array_like
+        array of model magnetic field (nT) in (Apex) magnetic eastward direction 
+        (same dimension as input)
+    Jn : array_like
+        array of model magnetic field (nT) in (Apex) magnetic northward direction 
+        (same dimension as input)
+
+
+    Note
+    ----
+    Array inputs should have the same dimensions.
+
+    S. M. Hatch
+    April 2025
+    """
+
+    # TODO: ADD CHECKS ON INPUT (?)
+    # assert coords in ['geo', 'apex']
+    assert coords in ['apex'],"geo coords not implemented for get_Jhoriz!"
+    # if coords == 'geo':
+    #     print("geo coords not implemented for get_Jhoriz!")
+    #     return None
+
+    m_matrix       = get_m_matrix(coeff_fn)
+    NT, MT, NV, MV = get_truncation_levels(coeff_fn)
+
+    # number of equations
+    neq = m_matrix.shape[0]
+
+    # turn coordinates/times into dask arrays
+    glat   = da.from_array(glat  , chunks = chunksize)
+    glon   = da.from_array(glon  , chunks = chunksize)
+    time   = da.from_array(time  , chunks = chunksize)
+    height = da.from_array(height, chunks = chunksize)
+
+    # get G0 matrix - but first make a wrapper that only takes dask arrays as input
+    _getG0 = lambda la, lo, t, h: getG0_Jtot(la, lo, t, h, epoch = epoch, h_R = h_R, NT = NT, MT = MT, NV = NV, MV = MV,
+                                        killpoloidal=kill_divfree,
+                                        killtoroidal=kill_curlfree)
+
+    # use that wrapper to calculate G0 for each block
+    G0 = da.map_blocks(_getG0, glat, glon, height, time, chunks = (2*chunksize, neq), new_axis = 1, dtype = np.float64)
+
+    # get a matrix with columns that are 19 unscaled current terms at the given coords:
+    J_matrix  = G0.dot( m_matrix ).compute()
+
+    # the rows of J_matrix now correspond to (east, north, east, north, ...) and must be
+    # reorganized so that we have only two large partitions: (east, north). Split and recombine:
+    J_chunks = [J_matrix[i : (i + 2*chunksize)] for i in range(0, J_matrix.shape[0], 2 * chunksize)]
+    J_e = np.vstack(tuple([J[                  :     J.shape[0]//2] for J in J_chunks]))
+    J_n = np.vstack(tuple([J[    J.shape[0]//2 : 2 * J.shape[0]//2] for J in J_chunks]))
+    # B_r = np.vstack(tuple([B[2 * B.shape[0]//3 :                  ] for B in J_chunks]))
+    Js  = np.vstack((J_e, J_n)).T
+
+    # prepare the scales (external parameters)
+    By, Bz, v, tilt, f107 = map(lambda x: x.flatten(), [By, Bz, v, tilt, f107]) # flatten input
+    ca = np.arctan2(By, Bz)
+    epsilon = np.abs(v)**(4/3.) * np.sqrt(By**2 + Bz**2)**(2/3.) * (np.sin(ca/2)**(8))**(1/3.) / 1000 # Newell coupling           
+    tau     = np.abs(v)**(4/3.) * np.sqrt(By**2 + Bz**2)**(2/3.) * (np.cos(ca/2)**(8))**(1/3.) / 1000 # Newell coupling - inverse 
+
+    # make a dict of the 19 external parameters (flat arrays)
+    external_params = {0  : np.ones_like(ca)           ,        # 'const'             
+                       1  : 1              * np.sin(ca),        # 'sinca'             
+                       2  : 1              * np.cos(ca),        # 'cosca'             
+                       3  : epsilon                    ,        # 'epsilon'           
+                       4  : epsilon        * np.sin(ca),        # 'epsilon_sinca'     
+                       5  : epsilon        * np.cos(ca),        # 'epsilon_cosca'     
+                       6  : tilt                       ,        # 'tilt'              
+                       7  : tilt           * np.sin(ca),        # 'tilt_sinca'        
+                       8  : tilt           * np.cos(ca),        # 'tilt_cosca'        
+                       9  : tilt * epsilon             ,        # 'tilt_epsilon'      
+                       10 : tilt * epsilon * np.sin(ca),        # 'tilt_epsilon_sinca'
+                       11 : tilt * epsilon * np.cos(ca),        # 'tilt_epsilon_cosca'
+                       12 : tau                        ,        # 'tau'               
+                       13 : tau            * np.sin(ca),        # 'tau_sinca'         
+                       14 : tau            * np.cos(ca),        # 'tau_cosca'         
+                       15 : tilt * tau                 ,        # 'tilt_tau'          
+                       16 : tilt * tau     * np.sin(ca),        # 'tilt_tau_sinca'    
+                       17 : tilt * tau     * np.cos(ca),        # 'tilt_tau_cosca'    
+                       18 : f107                        }       # 'f107'
+
+    # scale the 19 magnetic field terms, and add (the scales are tiled once for each component)
+    J = reduce(lambda x, y: x+y, [Js[i] * np.tile(external_params[i], 2) for i in range(19)])
+
+
+    # the resulting array will be stacked Be, Bn components. Return the partitions
+    return np.split(J, 2)
+
 
